@@ -1897,6 +1897,42 @@ func (a *app) focusWindow() {
 	w.Focus()
 }
 
+func isFile(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
+}
+
+func mergeSplitPaths(args []string) []string {
+	if n := len(args); n <= 1 || n > 32 {
+		return args
+	}
+	out := make([]string, 0, len(args))
+	var b strings.Builder
+	for i := 0; i < len(args); i++ {
+		if isFile(args[i]) {
+			out = append(out, args[i])
+			continue
+		}
+		b.Reset()
+		b.WriteString(args[i])
+		merged := false
+		for j := i + 1; j < len(args); j++ {
+			b.WriteByte(' ')
+			b.WriteString(args[j])
+			if isFile(b.String()) {
+				out = append(out, b.String())
+				i = j
+				merged = true
+				break
+			}
+		}
+		if !merged {
+			out = append(out, args[i])
+		}
+	}
+	return out
+}
+
 func parseArgs(argv []string) launch {
 	var l launch
 	if len(argv) > 0 && argv[0] == "/z" {
@@ -1905,9 +1941,7 @@ func parseArgs(argv []string) launch {
 	if len(argv) > 0 && strings.EqualFold(filepath.Base(argv[0]), "notepad.exe") {
 		argv = argv[1:]
 	}
-	for _, arg := range argv {
-		l.files = append(l.files, arg)
-	}
+	l.files = mergeSplitPaths(argv)
 	return l
 }
 
