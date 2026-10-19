@@ -1,0 +1,7 @@
+{
+  "name": "My Notepad Go",
+  "identifier": "cn.blyrin.mynotepadgo",
+  "version": "1.0.0",
+  "icon": "resources/icon.png",
+  "out": "build"
+}
