@@ -52,6 +52,11 @@ const (
 	endingCR   = "\r"
 )
 
+const (
+	heavyDocBytes = 50 << 20
+	heavyDocLines = 2_000_000
+)
+
 var endingLabels = map[string]string{
 	endingCRLF: "CRLF",
 	endingLF:   "LF",
@@ -114,6 +119,7 @@ type app struct {
 	weightOptions []string
 
 	quitting bool
+	heavy    bool
 
 	encPicker  bool
 	encPick    string
@@ -298,8 +304,9 @@ func (a *app) newState() *editor.State {
 }
 
 func (a *app) settings() {
+	heavy := a.heavyDoc()
 	st := a.ed
-	st.SoftWrap = a.wordWrap
+	st.SoftWrap = a.wordWrap && !heavy
 	st.ReadOnly = a.readOnly
 	st.TabSize = a.tabSize
 	st.Whitespace = editor.WhitespaceNone
@@ -314,9 +321,9 @@ func (a *app) settings() {
 		}
 	}
 	st.NoIndentGuides = !a.indentGuides
-	st.NoFolding = !a.folding
+	st.NoFolding = !a.folding || heavy
 	st.NoActiveLine = !a.activeLine
-	st.NoAutoClose = !a.autoClose
+	st.NoAutoClose = !a.autoClose || heavy
 	st.NoScrollPastEnd = !a.scrollPastEnd
 	st.CursorShape = a.cursorShape
 	st.WrapGuides = nil
@@ -324,7 +331,7 @@ func (a *app) settings() {
 		st.WrapGuides = []int{a.wrapMark}
 	}
 	st.DiffBase = nil
-	if a.changeMarks {
+	if a.changeMarks && !heavy {
 		st.DiffBase = a.base
 	}
 	st.OnInput = a.onInput
@@ -463,13 +470,17 @@ func charsetSample(data []byte) []byte {
 }
 
 func detectLegacyCharset(data []byte) charset {
-	if !strings.ContainsRune(decodeText(charsetGB18030, data), utf8.RuneError) {
-		return charsetGB18030
+	text := decodeText(charsetGB18030, data)
+	if strings.ContainsRune(strings.TrimSuffix(text, string(utf8.RuneError)), utf8.RuneError) {
+		return charsetLatin1
 	}
-	return charsetLatin1
+	return charsetGB18030
 }
 
 func decodeText(cs charset, data []byte) string {
+	if cs == charsetUTF8 && utf8.Valid(data) {
+		return string(data)
+	}
 	b, err := cs.enc.NewDecoder().Bytes(data)
 	if err != nil {
 		return string(data)
@@ -520,7 +531,19 @@ func normalizeEndings(text string) string {
 	if !strings.Contains(text, "\r") {
 		return text
 	}
-	return strings.ReplaceAll(strings.ReplaceAll(text, "\r\n", "\n"), "\r", "\n")
+	var b strings.Builder
+	b.Grow(len(text))
+	rest := text
+	for {
+		i := strings.IndexByte(rest, '\r')
+		if i < 0 {
+			b.WriteString(rest)
+			return b.String()
+		}
+		b.WriteString(rest[:i])
+		b.WriteByte('\n')
+		rest = strings.TrimPrefix(rest[i+1:], "\n")
+	}
 }
 
 func applyEnding(text, ending string) string {
@@ -658,6 +681,10 @@ func (a *app) shortcuts(c *ui.Context) {
 }
 
 func (a *app) toggleSetting(v *bool) {
+	if a.heavyDoc() {
+		a.pending = notice{appName, "文档过大，该选项已停用。"}
+		return
+	}
 	*v = !*v
 	a.saveSettings()
 	a.refreshMenu()
@@ -730,32 +757,42 @@ func (a *app) statusBar(c *ui.Context) {
 	if l := a.buf.Language(); l != nil {
 		lang = l.Name
 	}
-	panes := []string{
+	volatile := []string{
 		fmt.Sprintf("行 %d/%d", pos.Line+1, lines),
 		fmt.Sprintf("列 %d/%d", col, lineLen),
 		fmt.Sprintf("选定 %d", chars),
 		fmt.Sprintf("选行 %d", selLines),
+	}
+	fixed := []string{
 		fmt.Sprintf("%d 字节", a.buf.Len()),
 		endingName(a.documentEnding()),
 		a.documentCharset().name,
 		lang,
 	}
-	if a.conflict {
-		panes = append([]string{"磁盘上的文件已被其他程序修改"}, panes...)
+	if a.heavyDoc() {
+		fixed = append(fixed, "大文件模式")
 	}
-	ui.Row(c).Padding(3, 8).AlignItems(ui.Center).Background(t.Surface).
-		BorderWidth(1, 0, 0, 0).BorderColor(t.Border).Children(func() {
-		for i, pane := range panes {
+	if a.conflict {
+		volatile = append([]string{"原文件已被其他程序修改"}, volatile...)
+	}
+	pane := func(items []string, warn bool) {
+		for i, s := range items {
 			if i > 0 {
 				ui.Divider(c).Margin(0, 8)
 			}
-			text := ui.Text(c, pane).FontSize(12)
-			if i == 0 && a.conflict {
+			text := ui.Text(c, s).FontSize(12)
+			if warn && i == 0 {
 				text.TextColor(t.Warning)
 			} else {
 				text.TextColor(t.TextMuted)
 			}
 		}
+	}
+	ui.Row(c).Padding(3, 8).AlignItems(ui.Center).Background(t.Surface).
+		BorderWidth(1, 0, 0, 0).BorderColor(t.Border).Children(func() {
+		pane(volatile, a.conflict)
+		ui.Spacer(c)
+		pane(fixed, false)
 	})
 }
 
@@ -954,6 +991,21 @@ func (a *app) check(label, accel string, on bool, fn func(bool)) *mygo.MenuItem 
 		}}
 }
 
+func (a *app) heavyCheck(label, accel string, on bool, fn func(bool)) *mygo.MenuItem {
+	it := a.check(label, accel, on, fn)
+	it.Disabled = a.heavyDoc()
+	return it
+}
+
+func disableIf(heavy bool, items ...*mygo.MenuItem) []*mygo.MenuItem {
+	if heavy {
+		for _, it := range items {
+			it.Disabled = true
+		}
+	}
+	return items
+}
+
 func (a *app) command(label, accel string, cmd editor.Command) *mygo.MenuItem {
 	return a.item(label, accel, func() { a.run(cmd) })
 }
@@ -963,6 +1015,7 @@ func sub(label string, items ...*mygo.MenuItem) *mygo.MenuItem {
 }
 
 func (a *app) buildMenu() *mygo.Menu {
+	heavy := a.heavyDoc()
 	return mygo.NewMenu([]*mygo.MenuItem{
 		sub("文件(&F)",
 			a.item("新建(&N)", "Ctrl+N", a.newFile),
@@ -1081,7 +1134,7 @@ func (a *app) buildMenu() *mygo.Menu {
 			a.command("转到文件结尾(&D)", "Ctrl+End", editor.MoveDocEnd),
 		),
 		sub("查看(&V)",
-			a.check("自动换行(&R)", "Ctrl+W", a.wordWrap, func(on bool) { a.wordWrap = on }),
+			a.heavyCheck("自动换行(&R)", "Ctrl+W", a.wordWrap, func(on bool) { a.wordWrap = on }),
 			mygo.Separator(),
 			sub("行号(&N)", a.lineNumItems()...),
 			a.check("显示空白字符(&W)", "Ctrl+Shift+8", a.whitespace, func(on bool) { a.whitespace = on }),
@@ -1090,8 +1143,8 @@ func (a *app) buildMenu() *mygo.Menu {
 			a.check("高亮当前行(&G)", "Ctrl+Shift+I", a.activeLine, func(on bool) { a.activeLine = on }),
 			a.check("允许滚动超过末尾(&P)", "", a.scrollPastEnd, func(on bool) { a.scrollPastEnd = on }),
 			mygo.Separator(),
-			a.check("代码折叠(&F)", "", a.folding, func(on bool) { a.folding = on }),
-			sub("折叠(&O)",
+			a.heavyCheck("代码折叠(&F)", "", a.folding, func(on bool) { a.folding = on }),
+			sub("折叠(&O)", disableIf(heavy,
 				a.command("折叠(&F)", "Ctrl+Shift+[", editor.Fold),
 				a.command("展开(&U)", "Ctrl+Shift+]", editor.Unfold),
 				a.command("切换折叠(&T)", "", editor.ToggleFold),
@@ -1101,20 +1154,20 @@ func (a *app) buildMenu() *mygo.Menu {
 				mygo.Separator(),
 				a.command("折叠全部(&A)", "", editor.FoldAll),
 				a.command("展开全部(&L)", "", editor.UnfoldAll),
-			),
+			)...),
 			mygo.Separator(),
-			sub("变更记录标记(&H)",
-				a.check("显示变更记录标记(&S)", "", a.changeMarks, func(on bool) { a.changeMarks = on }),
+			sub("变更记录标记(&H)", disableIf(heavy,
+				a.heavyCheck("显示变更记录标记(&S)", "", a.changeMarks, func(on bool) { a.changeMarks = on }),
 				mygo.Separator(),
 				a.command("上一处更改(&V)", "Alt+Shift+F5", editor.PreviousHunk),
 				a.command("下一处更改(&X)", "Alt+F5", editor.NextHunk),
 				a.command("还原此更改(&Z)", "Ctrl+Alt+Z", editor.RevertHunk),
-			),
+			)...),
 			a.item("清除修改/撤销历史(&C)", "", a.clearHistory),
 		),
 		sub("外观(&P)",
 			a.item("字体(&F)...", "", a.openFontPicker),
-			sub("语法高亮方案集(&S)", a.languageItems()...),
+			sub("语法高亮方案集(&S)", disableIf(heavy, a.languageItems()...)...),
 			sub("光标形状(&C)", a.cursorItems()...),
 			mygo.Separator(),
 			a.check("Windows 深色模式(&D)", "", a.dark, func(on bool) { a.dark = on }),
@@ -1123,7 +1176,7 @@ func (a *app) buildMenu() *mygo.Menu {
 			sub("制表符设置(&T)", a.tabItems()...),
 			a.item("将制表符替换为空格(&R)", "", a.tabsToSpaces),
 			mygo.Separator(),
-			a.check("自动关闭括号与引号(&Q)", "", a.autoClose, func(on bool) { a.autoClose = on }),
+			a.heavyCheck("自动关闭括号与引号(&Q)", "", a.autoClose, func(on bool) { a.autoClose = on }),
 			a.check("启用多重光标选定(&M)", "", a.multicursor, func(on bool) { a.multicursor = on }),
 			mygo.Separator(),
 			a.check("劫持系统记事本(&S)", "", notepadHooked(), func(on bool) {
@@ -1252,6 +1305,7 @@ func (a *app) newDocument() {
 	a.conflict = false
 	a.relockFile("")
 	a.ed.SetSelections(editor.Selection{})
+	a.setHeavy(false)
 	a.updateTitle()
 }
 
@@ -1308,7 +1362,8 @@ func (a *app) clearHistory() {
 	ending := a.documentEnding()
 	a.buf.Reset(a.buf.String())
 	a.buf.SetLineEnding(ending)
-	a.base.Reset(a.buf.String())
+	a.resetBase(a.buf.String())
+	a.setHeavy(a.heavyDoc())
 	a.updateTitle()
 	a.redraw()
 }
@@ -1331,6 +1386,36 @@ func (a *app) tabsToSpaces() {
 	}
 	a.buf.Edit(edits...)
 	a.redraw()
+}
+
+func (a *app) heavyDoc() bool {
+	return a.buf.Len() >= heavyDocBytes || a.buf.LineCount() > heavyDocLines
+}
+
+func (a *app) setHeavy(on bool) {
+	if on == a.heavy {
+		return
+	}
+	a.heavy = on
+	if on {
+		a.pending = notice{appName, fmt.Sprintf("文件超过 %d MB 或 %d 行，已进入大文件模式。", heavyDocBytes>>20, heavyDocLines)}
+	}
+}
+
+func (a *app) applyLanguage(path string) {
+	if a.heavyDoc() {
+		a.buf.SetLanguage(nil)
+		return
+	}
+	a.buf.SetLanguage(editor.LanguageFor(path))
+}
+
+func (a *app) resetBase(text string) {
+	if a.heavyDoc() {
+		a.base.Reset("")
+		return
+	}
+	a.base.Reset(text)
 }
 
 func (a *app) documentCharset() charset {
@@ -1411,11 +1496,20 @@ func (a *app) readFile(path string) ([]byte, fileStamp, error) {
 	if err != nil {
 		return nil, fileStamp{}, err
 	}
-	data, err := io.ReadAll(f)
-	if err != nil {
+	data := make([]byte, info.Size())
+	n, err := io.ReadFull(f, data)
+	switch err {
+	case nil:
+		rest, err := io.ReadAll(f)
+		if err != nil {
+			return nil, fileStamp{}, err
+		}
+		return append(data, rest...), stampOf(info), nil
+	case io.EOF, io.ErrUnexpectedEOF:
+		return data[:n], stampOf(info), nil
+	default:
 		return nil, fileStamp{}, err
 	}
-	return data, stampOf(info), nil
 }
 
 func (a *app) load(path string, data []byte, stamp fileStamp) {
@@ -1430,14 +1524,15 @@ func (a *app) loadEncoded(path string, data []byte, stamp fileStamp, cs charset)
 	a.enc, a.ending = cs, ending
 	a.mu.Unlock()
 	a.buf.Reset(text)
-	a.buf.SetLanguage(editor.LanguageFor(path))
+	a.applyLanguage(path)
 	a.buf.SetLineEnding(ending)
-	a.base.Reset(text)
+	a.resetBase(text)
 	a.path = path
 	a.setStamp(stamp)
 	a.conflict = false
 	a.relockFile(path)
 	a.ed.SetSelections(editor.Selection{})
+	a.setHeavy(a.heavyDoc())
 	a.updateTitle()
 	a.setMenu()
 }
@@ -1579,11 +1674,11 @@ func (a *app) commitSave(path string, then func()) {
 
 func (a *app) afterSave(path string, stamp fileStamp) {
 	a.buf.MarkSaved()
-	a.base.Reset(a.buf.String())
+	a.resetBase(a.buf.String())
 	a.path = path
 	a.setStamp(stamp)
 	a.conflict = false
-	a.buf.SetLanguage(editor.LanguageFor(path))
+	a.applyLanguage(path)
 	a.relockFile(path)
 	a.updateTitle()
 }

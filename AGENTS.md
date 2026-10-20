@@ -38,6 +38,8 @@ My Notepad Go 是基于 [MyGo](https://github.com/egoist/mygo) 原生 UI 的 Win
 
 `openFile()`（菜单/拖拽 `openDropped` 同入口）→ 选文件 → goroutine 读盘 → `detectCharset` 判定编码 → `decodeText` 解码 → `loadEncoded` 写入 `a.buf` 并 `setCharset` / `setEnding` 记录文档属性、`setStamp` 记录磁盘指纹。
 
+打开链路按大文件设计，改动时保持：`readFile` 按 `Stat` 大小预分配（文件在读盘期间变大时再续读，不要回退到 `io.ReadAll` 反复扩容）；`decodeText` 对「已是 UTF-8 且 `utf8.Valid`」走 `string(data)` 快路径，不再过 transform；`normalizeEndings` 单遍扫描 `\r` 一次成型（CRLF 文件不要做两次 `ReplaceAll`，那会多出两份全文本）。实测 200MB UTF-8 文件约 0.7s、GC 后存活堆约 3 倍文件大小（`a.buf` rope + `a.base` 快照 + 编辑器态），瓶颈已转移到 `buf.Reset` / `base.Reset` 的 rope 构建（占六成以上）。
+
 ### 保存文档
 
 `confirmDiscard` 是所有可能丢数据的入口（新建、打开、退出、`OnClose`）的统一闸门，弹「保存/不保存/取消」；确认保存走 `commitSave(path, then)`，`then` 回调串联「保存后继续做某件事」。`writeTo` 负责合成字节：`documentText()`（`applyEnding` 套行尾符）+ `encodeText` 编码后交 `writeFileSafely` 落盘。
@@ -48,7 +50,7 @@ My Notepad Go 是基于 [MyGo](https://github.com/egoist/mygo) 原生 UI 的 Win
 
 内存文本永远是「UTF-8 + `\n`」：`a.buf` 只存规范化后的文本，`a.enc` 记文档编码、`a.ending` 记行尾符，**只在落盘时合成字节、读入时拆解**。改这里必须保持这条单向流水线，不要把编码/行尾符写回 `a.buf`。
 
-编码检测顺序固定：BOM → 合法 UTF-8 → `detectLegacyCharset`。最后一步只做一次 GB18030 无损解码试探：能解出（不含 `utf8.RuneError`）就按 GB18030 读，否则退回 ISO-8859-1。GB18030 覆盖全部 Unicode 且是 GBK 超集，中文 Legacy 文本走这条路；日、韩、繁中等非中文 CJK 的 Legacy 文件可能被按 GB18030 误读成乱码，此时用「编码 → 重新载入为...」手工纠正，不要为了区分它们把启发式打分加回来。检测只用前 64KB（`charsetSample`）。
+编码检测顺序固定：BOM → 合法 UTF-8 → `detectLegacyCharset`。最后一步只做一次 GB18030 无损解码试探：能解出（不含 `utf8.RuneError`）就按 GB18030 读，否则退回 ISO-8859-1；**试探前必须先剥掉样本末尾的一个 `utf8.RuneError`**，因为 64KB 抽样（`charsetSample`）大概率把多字节字符切断，解码器对残缺尾序列也会吐 `utf8.RuneError`，不剥就会把大文件中文 Legacy 文本误判成 ISO-8859-1 乱码（约一半概率，取决于截断对齐）。GB18030 覆盖全部 Unicode 且是 GBK 超集，中文 Legacy 文本走这条路；日、韩、繁中等非中文 CJK 的 Legacy 文件可能被按 GB18030 误读成乱码，此时用「编码 → 重新载入为...」手工纠正，不要为了区分它们把启发式打分加回来。检测只用前 64KB（`charsetSample`）。
 
 「编码」子菜单只平铺常用五项（UTF-8 / UTF-8 带 BOM / UTF-16 LE / UTF-16 BE / GB18030），由 `charsetMenuIDs` 决定；其余编码经「更多编码...」弹窗选择，表 `charsetGroups` 仍是唯一编码来源。
 
@@ -57,6 +59,14 @@ My Notepad Go 是基于 [MyGo](https://github.com/egoist/mygo) 原生 UI 的 Win
 ### 磁盘冲突检测
 
 「文件是否被别的程序改过」只认 `fileStamp`（修改时间 + 大小）指纹比对，不要用单一字段猜；取不到指纹时按「没有改过」处理——宁可漏报也不误报。窗口聚焦时 `OnFocus` 触发 `checkDisk`：文档没改过就重新载入，改过了置 `conflict` 由状态栏提示。
+
+### 大文件模式
+
+文档达到 `heavyDocBytes`（50MB）或行数超过 `heavyDocLines`（200 万）即进入大文件模式，判定走 `heavyDoc()`（`buf.Len()` / `buf.LineCount()`，均为 O(1)，可每帧现算，不要缓存成会过期的状态；`a.heavy` 只用于进入/退出时的 toast 边沿触发）。
+
+大文件模式下**强制关闭且禁止用户开启**：语法高亮（`applyLanguage` 不设语言）、括号自动闭合（`NoAutoClose`）、代码折叠（`NoFolding`）、变更标记（`DiffBase` 置 nil）、自动换行（`SoftWrap` 置 false），并且不建 `a.base` 快照（`resetBase`，省一份等长 rope）。菜单侧用 `heavyCheck` / `disableIf` 置灰「自动换行 / 代码折叠 / 折叠子菜单 / 变更记录标记子菜单 / 语法高亮方案集 / 自动关闭括号与引号」，快捷键 `Ctrl+W` 等经 `toggleSetting` 拦截并提示，状态栏追加「大文件模式」窗格。
+
+取舍依据（MyGo 0.5.5 实测）：200MB 代码文件全量 tokenize 约 2.7s 后台 CPU + 442MB 分配；`DiffBase` 每次打开都全量 diff 两份文本，约 227ms + 552MB 瞬时分配；自动换行的 `measureWraps` 同样要走遍全文档。括号匹配本身有 1000 行扫描上限且按「版本+光标」缓存，无语言时不做 token 化，成本可接受，MyGo 也没有单独开关，故只关自动闭合、不假装关掉了匹配。调整阈值或增删强制关闭项时，同步更新本段与 `.local/bench_open_test.go` 里的 `TestHeavyDocMode` / `TestHeavyDocLines`。
 
 ## 构建与开发命令
 
