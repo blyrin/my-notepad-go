@@ -121,6 +121,8 @@ type app struct {
 	quitting bool
 	heavy    bool
 
+	selCache selStats
+
 	encPicker  bool
 	encPick    string
 	encOptions []string
@@ -159,6 +161,13 @@ type askSpec struct {
 
 type notice struct {
 	title, text string
+}
+
+type selStats struct {
+	ver   uint64
+	sels  []editor.Selection
+	chars int
+	lines int
 }
 
 type fileStamp struct {
@@ -247,7 +256,9 @@ func (a *app) applySettings(s settings) {
 	if s.WrapMark > 0 {
 		a.wrapMark = s.WrapMark
 	}
-	a.cursorShape = editor.CursorShape(s.CursorShape)
+	if s.CursorShape <= uint8(editor.CursorUnderline) {
+		a.cursorShape = editor.CursorShape(s.CursorShape)
+	}
 	a.changeMarks = s.ChangeMarks
 	a.scrollPastEnd = s.ScrollPastEnd
 	a.multicursor = s.Multicursor
@@ -470,22 +481,22 @@ func charsetSample(data []byte) []byte {
 }
 
 func detectLegacyCharset(data []byte) charset {
-	text := decodeText(charsetGB18030, data)
+	text, _ := decodeText(charsetGB18030, data)
 	if strings.ContainsRune(strings.TrimSuffix(text, string(utf8.RuneError)), utf8.RuneError) {
 		return charsetLatin1
 	}
 	return charsetGB18030
 }
 
-func decodeText(cs charset, data []byte) string {
+func decodeText(cs charset, data []byte) (string, bool) {
 	if cs == charsetUTF8 && utf8.Valid(data) {
-		return string(data)
+		return string(data), true
 	}
 	b, err := cs.enc.NewDecoder().Bytes(data)
 	if err != nil {
-		return string(data)
+		return string(data), false
 	}
-	return string(b)
+	return string(b), true
 }
 
 func encodeText(cs charset, text string) ([]byte, int) {
@@ -597,6 +608,7 @@ func (a *app) updateTitle() {
 }
 
 func (a *app) view(c *ui.Context) {
+	a.trackHeavy()
 	if a.theme != a.dark {
 		a.theme = a.dark
 		if a.dark {
@@ -797,7 +809,13 @@ func (a *app) statusBar(c *ui.Context) {
 }
 
 func (a *app) selection() (chars, lines int) {
-	for _, s := range a.ed.Selections() {
+	sels := a.ed.Selections()
+	ver := a.buf.Version()
+	if a.selCache.ver == ver && slices.Equal(a.selCache.sels, sels) {
+		return a.selCache.chars, a.selCache.lines
+	}
+	snap := a.buf.Snapshot()
+	for _, s := range sels {
 		lo, hi := s.Anchor, s.Head
 		if lo == hi {
 			continue
@@ -805,10 +823,13 @@ func (a *app) selection() (chars, lines int) {
 		if lo > hi {
 			lo, hi = hi, lo
 		}
-		text := a.buf.Slice(lo, hi)
-		chars += utf8.RuneCountInString(text)
-		lines += 1 + strings.Count(text, "\n")
+		snap.Chunks(lo, hi, func(text string) bool {
+			chars += utf8.RuneCountInString(text)
+			return true
+		})
+		lines += a.buf.Pos(hi).Line - a.buf.Pos(lo).Line + 1
 	}
+	a.selCache = selStats{ver: ver, sels: sels, chars: chars, lines: lines}
 	return chars, lines
 }
 
@@ -950,7 +971,7 @@ func (a *app) setFontSize(size float32) {
 	}
 	a.fontSize = size
 	a.saveSettings()
-	a.rebuildEditor()
+	a.applyFont()
 }
 
 func (a *app) setFontWeight(weight int) {
@@ -959,7 +980,7 @@ func (a *app) setFontWeight(weight int) {
 	}
 	a.fontWeight = weight
 	a.saveSettings()
-	a.rebuildEditor()
+	a.applyFont()
 }
 
 func (a *app) setFontFamily(family string) {
@@ -968,13 +989,11 @@ func (a *app) setFontFamily(family string) {
 	}
 	a.fontFamily = family
 	a.saveSettings()
-	a.rebuildEditor()
+	a.applyFont()
 }
 
-func (a *app) rebuildEditor() {
-	sels := a.ed.Selections()
-	a.ed = a.newState()
-	a.ed.SetSelections(sels...)
+func (a *app) applyFont() {
+	a.ed.Font = ui.Font{Family: a.fontFamily, Size: a.fontSize, Weight: a.fontWeight}
 	a.redraw()
 }
 
@@ -1305,7 +1324,7 @@ func (a *app) newDocument() {
 	a.conflict = false
 	a.relockFile("")
 	a.ed.SetSelections(editor.Selection{})
-	a.setHeavy(false)
+	a.trackHeavy()
 	a.updateTitle()
 }
 
@@ -1360,10 +1379,11 @@ func (a *app) dirName() string {
 
 func (a *app) clearHistory() {
 	ending := a.documentEnding()
-	a.buf.Reset(a.buf.String())
+	text := a.buf.String()
+	a.buf.Reset(text)
 	a.buf.SetLineEnding(ending)
-	a.resetBase(a.buf.String())
-	a.setHeavy(a.heavyDoc())
+	a.syncBase(text)
+	a.trackHeavy()
 	a.updateTitle()
 	a.redraw()
 }
@@ -1410,12 +1430,28 @@ func (a *app) applyLanguage(path string) {
 	a.buf.SetLanguage(editor.LanguageFor(path))
 }
 
-func (a *app) resetBase(text string) {
+func (a *app) syncBase(text string) {
 	if a.heavyDoc() {
 		a.base.Reset("")
 		return
 	}
 	a.base.Reset(text)
+}
+
+func (a *app) trackHeavy() {
+	heavy := a.heavyDoc()
+	if heavy == a.heavy {
+		return
+	}
+	a.setHeavy(heavy)
+	if heavy {
+		a.buf.SetLanguage(nil)
+		a.base.Reset("")
+	} else {
+		a.applyLanguage(a.path)
+		a.base.Reset(a.buf.String())
+	}
+	a.setMenu()
 }
 
 func (a *app) documentCharset() charset {
@@ -1517,7 +1553,11 @@ func (a *app) load(path string, data []byte, stamp fileStamp) {
 }
 
 func (a *app) loadEncoded(path string, data []byte, stamp fileStamp, cs charset) {
-	raw := strings.TrimPrefix(decodeText(cs, data), "\ufeff")
+	raw, ok := decodeText(cs, data)
+	if !ok {
+		a.notify(notice{"解码失败", "无法按 " + cs.name + " 解码文件，已按原文显示。"})
+	}
+	raw = strings.TrimPrefix(raw, "\ufeff")
 	ending := detectEnding(raw)
 	text := normalizeEndings(raw)
 	a.mu.Lock()
@@ -1526,13 +1566,13 @@ func (a *app) loadEncoded(path string, data []byte, stamp fileStamp, cs charset)
 	a.buf.Reset(text)
 	a.applyLanguage(path)
 	a.buf.SetLineEnding(ending)
-	a.resetBase(text)
+	a.syncBase(text)
 	a.path = path
 	a.setStamp(stamp)
 	a.conflict = false
 	a.relockFile(path)
 	a.ed.SetSelections(editor.Selection{})
-	a.setHeavy(a.heavyDoc())
+	a.trackHeavy()
 	a.updateTitle()
 	a.setMenu()
 }
@@ -1541,7 +1581,8 @@ func (a *app) reload() {
 	if a.path == "" {
 		return
 	}
-	a.openPath(a.path)
+	path := a.path
+	a.confirmDiscard(func() { a.openPath(path) })
 }
 
 func (a *app) reloadCharsetAs(cs charset) {
@@ -1591,8 +1632,9 @@ func (a *app) saveFile() {
 }
 
 func (a *app) saveAsThen(title string, then func()) {
+	def := a.defaultPath()
 	go func() {
-		path, err := mygo.Dialog.Save(mygo.SaveDialogOptions{Parent: a.window(), Title: title, DefaultPath: a.defaultPath(), Filters: fileFilters()})
+		path, err := mygo.Dialog.Save(mygo.SaveDialogOptions{Parent: a.window(), Title: title, DefaultPath: def, Filters: fileFilters()})
 		if err != nil || path == "" {
 			return
 		}
@@ -1674,7 +1716,11 @@ func (a *app) commitSave(path string, then func()) {
 
 func (a *app) afterSave(path string, stamp fileStamp) {
 	a.buf.MarkSaved()
-	a.resetBase(a.buf.String())
+	if a.heavyDoc() {
+		a.base.Reset("")
+	} else {
+		a.base.Reset(a.buf.String())
+	}
 	a.path = path
 	a.setStamp(stamp)
 	a.conflict = false
@@ -1856,9 +1902,11 @@ func (a *app) checkDisk() {
 			return
 		}
 		if !a.diskChanged(stamp) {
-			if a.conflict {
-				a.onMain(a.clearConflict)
-			}
+			a.onMain(func() {
+				if a.conflict {
+					a.clearConflict()
+				}
+			})
 			return
 		}
 		if a.buf.Modified() {
@@ -1877,7 +1925,11 @@ func normalizePath(path string) string {
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
-	return strings.ToLower(filepath.Clean(path))
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
 }
 
 func fileSocketPath(normalized string) string {
@@ -1898,7 +1950,10 @@ func spawnInstances(files []string) {
 		return
 	}
 	for _, f := range files {
-		_ = exec.Command(exe, f).Start()
+		cmd := exec.Command(exe, f)
+		if cmd.Start() == nil {
+			go func() { _ = cmd.Wait() }()
+		}
 	}
 }
 

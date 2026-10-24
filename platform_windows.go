@@ -89,13 +89,35 @@ func (h hookKeys) hooked() bool {
 
 func (h hookKeys) conflict() error {
 	s := h.scope.reader()
-	if v, err := s.readString(h.ifeo, notepadValue); err == nil && strings.TrimSpace(v) != debuggerValue() {
+	if v, err := s.readString(h.ifeo, notepadValue); err == nil && strings.TrimSpace(v) != debuggerValue() && !debuggerStale(v) {
 		return fmt.Errorf("注册表项 %s 的 %s 值已被其他程序占用", h.ifeo, notepadValue)
 	}
-	if v, err := s.readString(h.appPaths, ""); err == nil && v != exePath() {
+	if v, err := s.readString(h.appPaths, ""); err == nil && v != "" && v != exePath() && !pathStale(v) {
 		return fmt.Errorf("注册表项 %s 已被其他程序占用", h.appPaths)
 	}
 	return nil
+}
+
+func pathStale(p string) bool {
+	if p == "" {
+		return false
+	}
+	_, err := os.Stat(p)
+	return err != nil && os.IsNotExist(err)
+}
+
+func debuggerStale(v string) bool {
+	v = strings.TrimSpace(v)
+	if quoted, ok := strings.CutPrefix(v, `"`); ok {
+		if end := strings.IndexByte(quoted, '"'); end >= 0 {
+			return pathStale(quoted[:end])
+		}
+		return pathStale(quoted)
+	}
+	if sp := strings.IndexByte(v, ' '); sp >= 0 {
+		v = v[:sp]
+	}
+	return pathStale(v)
 }
 
 func (h hookKeys) write(on bool) error {
@@ -108,21 +130,28 @@ func (h hookKeys) write(on bool) error {
 	dbg, err := h.scope.readString(h.ifeo, notepadValue)
 	if err != nil {
 		if errors.Is(err, registry.ErrNotExist) {
-			return nil
+			return h.clearAppPaths()
 		}
 		return err
 	}
-	if strings.TrimSpace(dbg) != debuggerValue() {
+	if strings.TrimSpace(dbg) != debuggerValue() && !debuggerStale(dbg) {
 		return fmt.Errorf("注册表项 %s 的 %s 值不属于本程序，未做修改", h.ifeo, notepadValue)
 	}
 	if err := h.scope.deleteValue(h.ifeo, notepadValue); err != nil {
 		return err
 	}
+	return h.clearAppPaths()
+}
+
+func (h hookKeys) clearAppPaths() error {
 	target, err := h.scope.readString(h.appPaths, "")
-	if err != nil || target != exePath() {
+	if err != nil {
 		return nil
 	}
-	return h.scope.deleteTree(h.appPaths)
+	if target == exePath() || pathStale(target) {
+		return h.scope.deleteTree(h.appPaths)
+	}
+	return nil
 }
 
 func setNotepadHook(on bool) error {
