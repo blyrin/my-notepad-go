@@ -128,6 +128,7 @@ go tool mygo migrate-ui .             # 预览 UI 值 API 迁移（-write 才落
 
 - **菜单是唯一权威的选项状态源**：勾选态每次 `buildMenu()` 现场读 `app` 字段，改选项后 `refreshMenu()`（必要时 `saveSettings()`），不要就地改菜单项。
 - 快捷键双轨：菜单用 `Accelerator`，代码内用 `c.OnShortcut` / `a.ed.OnInput`。
+- ESC 关窗走 `shortcuts()` 里的 `ui.Overlay` + `OverlayShortcut(0, KeyEscape)` 兜底，**不要**用窗口级 `c.OnShortcut(0, KeyEscape)`：MyGo 里窗口级注册进路由表后，`claimed` 检查会拦截焦点元素的 KeyDown 投递，编辑器 keymap 的 `Cancel`（多光标归一、取消选区、关查找栏）就永远收不到 ESC。overlay 注册不参与 `claimed`，只在「焦点链没人认领」时接住按键，天然实现「编辑器先消费、没消费才关窗」。该 overlay 必须构建在 `fontPicker` 等 Modal 之前（serial 更小，ESC 才优先关弹窗），放在 `shortcuts()`（root 构建前）即可保证。
 - 字体（族 / 字号 / 字重）只在「外观 → 字体...」对话框里设置，菜单不放缩放与字重项；字号另有快捷键 `Ctrl+加号` / `Ctrl+减号` / `Ctrl+0`（重置）与 `Ctrl+滚轮`。
 
 ## 项目专属 Agent 说明

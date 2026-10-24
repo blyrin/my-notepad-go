@@ -671,9 +671,11 @@ func (a *app) openDropped() {
 }
 
 func (a *app) shortcuts(c *ui.Context) {
-	c.OnShortcut(0, ui.KeyEscape, func() {
-		if w := a.window(); w != nil {
-			w.Close()
+	ui.Overlay(c, func() {
+		if ui.Box(c).Key("window escape").OverlayShortcut(0, ui.KeyEscape) {
+			if w := a.window(); w != nil {
+				w.Close()
+			}
 		}
 	})
 	c.OnShortcut(ui.Ctrl, ui.KeyN, a.newFile)
