@@ -730,6 +730,8 @@ func (a *app) blockMultiCursor(ev ui.InputEvent) bool {
 		case ev.Mods == ui.Ctrl|ui.Shift && ev.Key == ui.KeyL:
 			return true
 		}
+	default:
+		return false
 	}
 	return false
 }
@@ -739,8 +741,9 @@ func multiCursorCommand(cmd editor.Command) bool {
 	case editor.SelectNext, editor.SelectPrevious, editor.SelectAllMatches,
 		editor.AddCursorAbove, editor.AddCursorBelow, editor.SplitSelectionIntoLines:
 		return true
+	default:
+		return false
 	}
-	return false
 }
 
 func (a *app) contextMenu(m *ui.Menu) {
@@ -1529,21 +1532,21 @@ func (a *app) readFile(path string) ([]byte, fileStamp, error) {
 	if err != nil {
 		return nil, fileStamp{}, err
 	}
-	defer f.Close()
+	defer func(f *os.File) { _ = f.Close() }(f)
 	info, err := f.Stat()
 	if err != nil {
 		return nil, fileStamp{}, err
 	}
 	data := make([]byte, info.Size())
 	n, err := io.ReadFull(f, data)
-	switch err {
-	case nil:
+	switch {
+	case err == nil:
 		rest, err := io.ReadAll(f)
 		if err != nil {
 			return nil, fileStamp{}, err
 		}
 		return append(data, rest...), stampOf(info), nil
-	case io.EOF, io.ErrUnexpectedEOF:
+	case err == io.EOF, errors.Is(err, io.ErrUnexpectedEOF):
 		return data[:n], stampOf(info), nil
 	default:
 		return nil, fileStamp{}, err
@@ -1664,6 +1667,7 @@ func (a *app) saveTo(path string, then func()) {
 			return
 		case saveReload:
 			return
+		default:
 		}
 		a.commitSave(path, then)
 	}()
@@ -1789,8 +1793,8 @@ func (a *app) writeTo(path string) (fileStamp, error) {
 }
 
 func writeFileSafely(path string, write func(io.Writer) error) error {
-	if real, err := filepath.EvalSymlinks(path); err == nil {
-		path = real
+	if realPath, err := filepath.EvalSymlinks(path); err == nil {
+		path = realPath
 	}
 	info, statErr := os.Stat(path)
 	tmp, err := createSibling(path)
@@ -1801,19 +1805,19 @@ func writeFileSafely(path string, write func(io.Writer) error) error {
 		return err
 	}
 	if err := writeAndSync(tmp, write); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
 		return err
 	}
-	if cerr := tmp.Close(); cerr != nil {
-		os.Remove(tmp.Name())
-		return cerr
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmp.Name())
+		return err
 	}
 	if statErr == nil {
 		_ = os.Chmod(tmp.Name(), info.Mode())
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
-		os.Remove(tmp.Name())
+		_ = os.Remove(tmp.Name())
 		if statErr == nil {
 			return writeFileInPlace(path, write)
 		}
@@ -1846,7 +1850,7 @@ func writeFileInPlace(path string, write func(io.Writer) error) error {
 		return err
 	}
 	if err := writeAndSync(f, write); err != nil {
-		f.Close()
+		_ = f.Close()
 		return err
 	}
 	return f.Close()
@@ -1940,8 +1944,8 @@ func fileSocketPath(normalized string) string {
 }
 
 func fileKey(path string) string {
-	if real, err := filepath.EvalSymlinks(path); err == nil {
-		path = real
+	if realPath, err := filepath.EvalSymlinks(path); err == nil {
+		path = realPath
 	}
 	return normalizePath(path)
 }
@@ -1971,7 +1975,7 @@ func (a *app) lockPath(normalized string, ping bool) bool {
 				_, _ = conn.Write([]byte{0})
 				_, _ = io.Copy(io.Discard, conn)
 			}
-			conn.Close()
+			_ = conn.Close()
 			return true
 		}
 		_ = os.Remove(sock)
@@ -2001,7 +2005,7 @@ func (a *app) releaseFileLock() {
 	if ln == nil {
 		return
 	}
-	ln.Close()
+	_ = ln.Close()
 	if fi != nil {
 		if cur, err := os.Stat(sock); err == nil && os.SameFile(cur, fi) {
 			_ = os.Remove(sock)
@@ -2032,7 +2036,7 @@ func (a *app) serveFileLock(ln net.Listener) {
 		}
 		_ = conn.SetDeadline(time.Now().Add(time.Second))
 		_, _ = io.Copy(io.Discard, conn)
-		conn.Close()
+		_ = conn.Close()
 		a.focusWindow()
 	}
 }
