@@ -109,14 +109,12 @@ func pathStale(p string) bool {
 func debuggerStale(v string) bool {
 	v = strings.TrimSpace(v)
 	if quoted, ok := strings.CutPrefix(v, `"`); ok {
-		if end := strings.IndexByte(quoted, '"'); end >= 0 {
-			return pathStale(quoted[:end])
+		if head, _, ok := strings.Cut(quoted, `"`); ok {
+			return pathStale(head)
 		}
 		return pathStale(quoted)
 	}
-	if sp := strings.IndexByte(v, ' '); sp >= 0 {
-		v = v[:sp]
-	}
+	v, _, _ = strings.Cut(v, " ")
 	return pathStale(v)
 }
 
@@ -222,7 +220,7 @@ func (s regScope) readString(path, name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer key.Close()
+	defer func(k registry.Key) { _ = k.Close() }(key)
 	v, _, err := key.GetStringValue(name)
 	return v, err
 }
@@ -240,7 +238,7 @@ func (s regScope) setString(path, name, value string) error {
 	if err != nil {
 		return err
 	}
-	defer key.Close()
+	defer func(k registry.Key) { _ = k.Close() }(key)
 	return key.SetStringValue(name, value)
 }
 
@@ -252,7 +250,7 @@ func (s regScope) deleteValue(path, name string) error {
 		}
 		return err
 	}
-	defer key.Close()
+	defer func(k registry.Key) { _ = k.Close() }(key)
 	if err := key.DeleteValue(name); err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return err
 	}
@@ -268,7 +266,7 @@ func (s regScope) deleteTree(path string) error {
 		return err
 	}
 	subs, err := key.ReadSubKeyNames(-1)
-	key.Close()
+	_ = key.Close()
 	if err != nil {
 		return err
 	}

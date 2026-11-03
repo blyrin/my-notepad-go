@@ -1,0 +1,17 @@
+version: "2"
+
+run:
+  go: "1.27"
+  timeout: 5m
+
+linters:
+  default: standard
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - my-notepad-go

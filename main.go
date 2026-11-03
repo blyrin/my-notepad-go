@@ -546,14 +546,14 @@ func normalizeEndings(text string) string {
 	b.Grow(len(text))
 	rest := text
 	for {
-		i := strings.IndexByte(rest, '\r')
-		if i < 0 {
+		head, tail, found := strings.Cut(rest, "\r")
+		if !found {
 			b.WriteString(rest)
 			return b.String()
 		}
-		b.WriteString(rest[:i])
+		b.WriteString(head)
 		b.WriteByte('\n')
-		rest = strings.TrimPrefix(rest[i+1:], "\n")
+		rest = strings.TrimPrefix(tail, "\n")
 	}
 }
 

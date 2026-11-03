@@ -78,9 +78,11 @@ go tool mygo dev                      # 监视 Go 代码变更自动重建重启
 go tool mygo build                    # 生产构建到 mygo.json 的 out（build/），Windows 需 NSIS
 go tool mygo vet .                    # go vet + 原生 UI 构建期生命周期检查，提交前运行
 go tool mygo migrate-ui .             # 预览 UI 值 API 迁移（-write 才落盘）
+golangci-lint run ./...                # 静态检查（`.golangci.yml`）
+golangci-lint fmt ./...                # 格式化（gofmt + goimports）
 ```
 
-- 验证以静态阅读与 `go tool mygo vet .` 为准；不执行 `go build`/`go run`/`mygo build`/`mygo dev`，不编写与执行测试。
+- 验证以静态阅读与 `go tool mygo vet .` 为准；不执行 `go build`/`go run`/`mygo build`/`mygo dev`，不编写与执行测试。`golangci-lint run ./...` 可执行。
 - 依赖：`golang.org/x/text`（编解码）与 `github.com/google/uuid`（临时文件名、GUID）。新增编码只改 `main.go` 的编码表 `charsetGroups` 与菜单可见集 `charsetMenuIDs`，不引新库。
 - 动 `platform_*.go` 后，用 `GOOS=linux go build ./...` 与 `GOOS=js GOARCH=wasm go build ./...` 交叉验证。
 - 升级 MyGo 时，按 `.agents/skills/mygo-maintenance/SKILL.md` 阅读 `docs/ui/migration.md`（`0.x` 小版本升级也算破坏性升级）。
